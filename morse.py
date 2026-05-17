@@ -1,54 +1,57 @@
-import os
 import sys
 import time
 import array
 import math
-import random
 import pygame
-import moderngl  # 导入现代 OpenGL 绑定库
+import moderngl
+import ctypes
 
-# --- 核心参数配置保持不变 ---
+# ==============================================================================
+# 1. 基础配置与常量定义
+# ==============================================================================
+VIRTUAL_WIDTH, VIRTUAL_HEIGHT = 1000, 600
+ASPECT_RATIO = VIRTUAL_WIDTH / VIRTUAL_HEIGHT
+
 INITIAL_WPM = 15
 INITIAL_DOT_DURATION = 1.2 / INITIAL_WPM
 WINDOW_SIZE = 15
 
+# 摩尔斯电码字典
 MORSE_DICT = {
-    '.-': 'A', '-...': 'B', '-.-.': 'C', '-..': 'D', '.': 'E',
-    '..-.': 'F', '--.': 'G', '....': 'H', '..': 'I', '.---': 'J',
-    '-.-': 'K', '.-..': 'L', '--': 'M', '-.': 'N', '---': 'O',
-    '.--.': 'P', '--.-': 'Q', '.-.': 'R', '...': 'S', '-': 'T',
-    '..': 'U', '...-': 'V', '.--': 'W', '-..-': 'X', '-.--': 'Y',
-    '--..': 'Z', '.----': '1', '..---': '2', '...--': '3', '....-': '4',
-    '.....': '5', '-....': '6', '--...': '7', '---..': '8', '----.': '9',
-    '-----': '0'
+    '.-': 'A', '-...': 'B', '-.-.': 'C', '-..': 'D', '.': 'E', '..-.': 'F', '--.': 'G',
+    '....': 'H', '..': 'I', '.---': 'J', '-.-': 'K', '.-..': 'L', '--': 'M', '-.': 'N',
+    '---': 'O', '.--.': 'P', '--.-': 'Q', '.-.': 'R', '...': 'S', '-': 'T', '..-': 'U',
+    '...-': 'V', '.--': 'W', '-..-': 'X', '-.--': 'Y', '--..': 'Z', '.----': '1',
+    '..---': '2', '...--': '3', '....-': '4', '.....': '5', '-....': '6', '--...': '7',
+    '---..': '8', '----.': '9', '-----': '0'
 }
 
-# =====================================================================
-# 【GLSL 着色器代码】1. 新增残影混合着色器 2. 优化主渲染着色器
-# =====================================================================
+# ==============================================================================
+# 2. GLSL 着色器源码 (OpenGL)
+# ==============================================================================
 VERTEX_SHADER = """
 #version 330
 in vec2 in_vert;
 in vec2 in_texcoord;
 out vec2 v_texcoord;
+
 void main() {
     gl_Position = vec4(in_vert, 0.0, 1.0);
     v_texcoord = vec2(in_texcoord.x, 1.0 - in_texcoord.y);
 }
 """
 
-# 用于将“前一帧的残影”与“当前输入帧”进行物理混合的着色器
 PERSISTENCE_SHADER = """
 #version 330
 uniform sampler2D u_current_frame;
 uniform sampler2D u_prev_frame;
-uniform float u_decay; // 荧光粉衰减系数
+uniform float u_decay; 
 in vec2 v_texcoord;
 out vec4 f_color;
+
 void main() {
     vec4 current = texture(u_current_frame, v_texcoord);
     vec4 prev = texture(u_prev_frame, v_texcoord);
-    // 残影衰减混合：当前帧亮部会瞬间照亮，暗下去时会保留旧帧的遗留
     f_color = max(current, prev * u_decay);
 }
 """
@@ -61,446 +64,488 @@ uniform bool u_crt_on;
 in vec2 v_texcoord;
 out vec4 f_color;
 
-// 1. 稍微加重一点桶形畸变
 vec2 distort(vec2 uv) {
     uv = (uv - 0.5) * 2.0;
     uv.x *= 1.0 + pow((uv.y / 9.0), 2.0); 
     uv.y *= 1.0 + pow((uv.x / 8.0), 2.0);
-    uv = (uv / 2.0) + 0.5;
-    return uv;
+    return (uv / 2.0) + 0.5;
 }
 
-// 2. 高效的 GPU 伪随机噪点
 float pseudo_random(vec2 co) {
-    return fract(sin(dot(co.xy ,vec2(12.9898, 78.233))) * 43758.5453);
+    return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
 void main() {
-    // 如果关闭了 CRT 效果，直接输出原始高清纹理
     if (!u_crt_on) {
         f_color = texture(u_texture, v_texcoord);
         return;
     }
 
-    // --- CRT 效果开启时的渲染逻辑 ---
     vec2 uv = distort(v_texcoord);
-    
-    // 玻璃边界裁剪
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         f_color = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
-    // 3. 【横向荧光粉光晕扩散（物理模拟眩光）】
+    // 辉光 (Glow Effect)
     vec3 glow = vec3(0.0);
     float glow_weights[5] = float[](0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
-    
     vec3 base_color = texture(u_texture, uv).rgb;
     glow += base_color * glow_weights[0];
-    
     for(int i = 1; i < 5; i++) {
-        float offset = float(i) * 0.0012; // 眩光宽度控制
+        float offset = float(i) * 0.0012; 
         glow += texture(u_texture, uv + vec2(offset, 0.0)).rgb * glow_weights[i];
         glow += texture(u_texture, uv - vec2(offset, 0.0)).rgb * glow_weights[i];
     }
-    
-    // 4. 【微观网格物理错位】模拟电子枪三原色发发光溢出
+
+    // 色差色散 (Chromatic Aberration)
     vec3 crt_color;
     crt_color.r = texture(u_texture, uv + vec2(0.001, 0.0)).r;
     crt_color.g = base_color.g;
     crt_color.b = texture(u_texture, uv - vec2(0.001, 0.0)).b;
-    
-    // 5. 将计算出的“高光眩光层”叠加到画面中
     crt_color += glow * 1.1; 
 
-    // 6. 动态模拟噪点 
+    // 噪点模拟 (Grain)
     float grain = pseudo_random(uv + sin(u_time)) * 0.06;
     crt_color += vec3(grain);
 
-    // 7. 电压高频闪烁 (Flicker)
+    // 屏幕闪烁 (Flicker)
     float flicker = 0.985 + 0.015 * sin(u_time * 50.0) * cos(u_time * 20.0);
     crt_color *= flicker;
 
-    // 8. 保留你满意的单条极细暗带
+    // 滚动条纹 (Rolling Scanbar)
     float wave = sin(uv.y * 3.14159 - u_time * 0.6);
-    float normalized_wave = wave * 0.5 + 0.5;
-    float bar_factor = pow(normalized_wave, 128.0);
-    float single_bar = mix(1.0, 0.55, bar_factor);
-    crt_color *= single_bar;
+    float bar_factor = pow(wave * 0.5 + 0.5, 128.0);
+    crt_color *= mix(1.0, 0.55, bar_factor);
 
-    // 9. 【横向经典扫描线】
+    // 扫描线 (Scanlines)
     float scanline = sin(uv.y * 550.0 * 3.14159) * 0.12; 
     crt_color -= vec3(scanline);
+    crt_color *= (0.78 + 0.22 * sin(uv.x * 750.0 * 3.14159));
 
-    // 10. 【纵向孔径栅格】
-    float mask = 0.78 + 0.22 * sin(uv.x * 750.0 * 3.14159);
-    crt_color *= mask;
-
-    // 11. 柔和的边缘暗角 (Vignette)
+    // 暗角 (Vignette)
     float vignette = uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y);
-    vignette = clamp(pow(16.0 * vignette, 0.15), 0.0, 1.0);
-    crt_color *= vignette;
-
-    f_color = vec4(crt_color, 1.0);
+    f_color = vec4(crt_color * clamp(pow(16.0 * vignette, 0.15), 0.0, 1.0), 1.0);
 }
 """
 
+
+# ==============================================================================
+# 3. 系统级辅助函数 (DPI, IME, 视口计算)
+# ==============================================================================
+def init_windows_dpi():
+    """在 Windows 系统下启用高 DPI 适配，防止鼠标点击错位"""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+def disable_ime():
+    """禁用系统输入法，避免干扰按键响应"""
+    if sys.platform == "win32":
+        hwnd = ctypes.windll.user32.GetActiveWindow()
+        if hwnd:
+            ctypes.windll.imm32.ImmAssociateContext(hwnd, 0)
+
+
+def calculate_viewport(window_w, window_h):
+    """根据当前窗口大小计算保持宽横比的 OpenGL 视口"""
+    window_ratio = window_w / window_h
+    if window_ratio > ASPECT_RATIO:
+        vp_w = int(window_h * ASPECT_RATIO)
+        return (window_w - vp_w) // 2, 0, vp_w, window_h
+    else:
+        vp_h = int(window_w / ASPECT_RATIO)
+        return 0, (window_h - vp_h) // 2, window_w, vp_h
+
+
 def generate_beep_sound(frequency=1000, sample_rate=44100):
-    num_samples = sample_rate
-    audio_buffer = array.array('h', [0] * (num_samples * 2))
-    for i in range(num_samples):
+    """生成正弦波蜂鸣声"""
+    audio_buffer = array.array('h', [0] * (sample_rate * 2))
+    for i in range(sample_rate):
         t = float(i) / sample_rate
         value = int(32767 * math.sin(2 * math.pi * frequency * t))
-        audio_buffer[i * 2] = value      
-        audio_buffer[i * 2 + 1] = value  
+        audio_buffer[i * 2] = audio_buffer[i * 2 + 1] = value
     return pygame.mixer.Sound(buffer=audio_buffer)
 
 
+# ==============================================================================
+# 4. UI 图标绘制函数
+# ==============================================================================
 def draw_mute_icon(screen, rect, is_muted):
     cx, cy = rect.center
-    body_color = (65, 85, 90) if is_muted else (0, 255, 200)
-    pygame.draw.rect(screen, body_color, (cx - 12, cy - 6, 6, 12))
-    poly_points = [(cx - 6, cy - 6), (cx, cy - 12), (cx, cy + 12), (cx - 6, cy + 6)]
-    pygame.draw.polygon(screen, body_color, poly_points)
-    
+    color = (65, 85, 90) if is_muted else (0, 255, 200)
+
+    # 喇叭本体
+    pygame.draw.rect(screen, color, (cx - 14, cy - 5, 6, 10))
+    pygame.draw.polygon(
+        screen,
+        color,
+        [(cx - 8, cy - 5), (cx - 2, cy - 10), (cx - 2, cy + 10), (cx - 8, cy + 5)],
+    )
+
+    # 右侧状态
     if is_muted:
-        x_color = (255, 90, 90)
-        pygame.draw.line(screen, x_color, (cx + 5, cy - 6), (cx + 15, cy + 6), 2)
-        pygame.draw.line(screen, x_color, (cx + 15, cy - 6), (cx + 5, cy + 6), 2)
+        # 静音状态绘制红色 "X"
+        pygame.draw.line(screen, (255, 90, 90), (cx + 4, cy - 5), (cx + 14, cy + 5), 2)
+        pygame.draw.line(screen, (255, 90, 90), (cx + 4, cy + 5), (cx + 14, cy - 5), 2)
     else:
-        wave_color = (0, 255, 200)
-        pygame.draw.arc(screen, wave_color, (cx - 4, cy - 8, 16, 16), -math.pi/3, math.pi/3, 2)
-        pygame.draw.arc(screen, wave_color, (cx - 8, cy - 13, 26, 26), -math.pi/3, math.pi/3, 2)
+        # 正常状态：绘制声波弧线
+        for r, w in [(16, 8), (28, 14)]:
+            pygame.draw.arc(
+                screen,
+                color,
+                (cx + 2 - w, cy - w, r, r),
+                -math.pi / 3,
+                math.pi / 3,
+                2,
+            )
 
 
 def draw_crt_icon(screen, rect, crt_on):
     cx, cy = rect.center
     color = (0, 255, 200) if crt_on else (65, 85, 90)
+    # 显示器外框
     pygame.draw.rect(screen, color, (cx - 14, cy - 10, 28, 20), 2, border_radius=3)
+    # 内屏
     pygame.draw.rect(screen, color, (cx - 10, cy - 7, 18, 14), 1)
+    # 天线
     pygame.draw.line(screen, color, (cx - 6, cy - 10), (cx - 12, cy - 16), 2)
     pygame.draw.line(screen, color, (cx + 6, cy - 10), (cx + 12, cy - 16), 2)
 
 
+def draw_fullscreen_icon(screen, rect, is_fullscreen):
+    cx, cy = rect.center
+    color = (0, 255, 200) if is_fullscreen else (65, 85, 90)
+    size = 11
+    # 绘制四个角的直角扩展边框
+    pygame.draw.lines(screen, color, False,
+                      [(cx - size, cy - size + 5), (cx - size, cy - size), (cx - size + 5, cy - size)], 2)
+    pygame.draw.lines(screen, color, False,
+                      [(cx + size - 5, cy - size), (cx + size, cy - size), (cx + size, cy - size + 5)], 2)
+    pygame.draw.lines(screen, color, False,
+                      [(cx - size, cy + size - 5), (cx - size, cy + size), (cx - size + 5, cy + size)], 2)
+    pygame.draw.lines(screen, color, False,
+                      [(cx + size - 5, cy + size), (cx + size, cy + size), (cx + size, cy + size - 5)], 2)
+
+
+# ==============================================================================
+# 5. 主程序核心逻辑
+# ==============================================================================
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 def main():
+    # 5.1 初始化 Pygame 与音频配置
+    init_windows_dpi()
     pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=256, allowedchanges=0)
     pygame.init()
-    pygame.font.init()
+    if hasattr(pygame.key, 'stop_text_input'):
+        pygame.key.stop_text_input()
 
-    WIDTH, HEIGHT = 1000, 600
-    pygame.display.set_mode((WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF | pygame.HIDDEN)
-    
-    try:
-        window_icon = pygame.image.load("morse.jpg") # 确保你的根目录下有 icon.png
-        pygame.display.set_icon(window_icon)
-    except Exception as e:
-        print(f"未能加载窗口图标: {e}，将使用系统默认图标。")
-
-    pygame.display.set_mode((WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF)
+    current_window_w, current_window_h = 1000, 600
+    pygame.display.set_mode((current_window_w, current_window_h), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
     pygame.display.set_caption("Morse Terminal")
 
-    # =====================================================================
-    # 【ModernGL 高级配置：引入 Framebuffer 历史链条】
-    # =====================================================================
+    try:
+        pygame.display.set_icon(pygame.image.load("morse.jpg"))
+    except Exception:
+        pass
+    disable_ime()
+
+    # 5.2 初始化 ModernGL 与着色器编译
     ctx = moderngl.create_context()
-    pg_surface = pygame.Surface((WIDTH, HEIGHT))
-    
-    # 编译两个 Shader 程序
+    pg_surface = pygame.Surface((VIRTUAL_WIDTH, VIRTUAL_HEIGHT))
+
     prog_crt = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
     prog_persist = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=PERSISTENCE_SHADER)
-    
-    vertices = array.array('f', [
-        -1.0,  1.0,   0.0, 0.0,  
-        -1.0, -1.0,   0.0, 1.0,  
-         1.0,  1.0,   1.0, 0.0,  
-         1.0, -1.0,   1.0, 1.0,  
+
+    # 顶点数据配置（2D 全屏贴图纹理坐标映射）
+    vbo_data = array.array('f', [
+        -1.0, 1.0, 0.0, 0.0,
+        -1.0, -1.0, 0.0, 1.0,
+        1.0, 1.0, 1.0, 0.0,
+        1.0, -1.0, 1.0, 1.0
     ])
-    vbo = ctx.buffer(vertices)
+    vbo = ctx.buffer(vbo_data)
     vao_crt = ctx.vertex_array(prog_crt, [(vbo, '2f 2f', 'in_vert', 'in_texcoord')], mode=moderngl.TRIANGLE_STRIP)
-    vao_persist = ctx.vertex_array(prog_persist, [(vbo, '2f 2f', 'in_vert', 'in_texcoord')], mode=moderngl.TRIANGLE_STRIP)
-    
-    # 基础 Pygame 映射纹理
-    texture_input = ctx.texture((WIDTH, HEIGHT), 4)
+    vao_persist = ctx.vertex_array(prog_persist, [(vbo, '2f 2f', 'in_vert', 'in_texcoord')],
+                                   mode=moderngl.TRIANGLE_STRIP)
+
+    # 纹理与帧缓冲双缓冲（用于生成 CRT 荧光屏绿光残影余晖）
+    texture_input = ctx.texture((VIRTUAL_WIDTH, VIRTUAL_HEIGHT), 4)
     texture_input.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
-    # 核心：为了实现流畅的流光暂留，建立两个纹理进行帧与帧之间的交替读写（Ping-Pong Buffer）
-    persist_tex_A = ctx.texture((WIDTH, HEIGHT), 4)
-    persist_tex_B = ctx.texture((WIDTH, HEIGHT), 4)
-    for tex in [persist_tex_A, persist_tex_B]:
-        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        
-    # 创建离屏渲染帧缓冲区 (FBO) 用于装载暂留纹理
+    persist_tex_A = ctx.texture((VIRTUAL_WIDTH, VIRTUAL_HEIGHT), 4)
+    persist_tex_B = ctx.texture((VIRTUAL_WIDTH, VIRTUAL_HEIGHT), 4)
     fbo_A = ctx.framebuffer(color_attachments=[persist_tex_A])
     fbo_B = ctx.framebuffer(color_attachments=[persist_tex_B])
 
-    # 预先清空缓冲区
-    fbo_A.clear(0, 0, 0, 1)
-    fbo_B.clear(0, 0, 0, 1)
+    for f in [fbo_A, fbo_B]:
+        f.clear(0, 0, 0, 1)
+    for t in [persist_tex_A, persist_tex_B]:
+        t.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
-    # 帧交替状态控制指针
+    # 5.3 变量及状态初始化
     flip_flop = True
-
     try:
         font_large = pygame.font.SysFont("Courier New", 54, bold=True)
         font_small = pygame.font.SysFont("Courier New", 26, bold=True)
         font_menu = pygame.font.SysFont("Courier New", 18, bold=True)
-    except:
-        font_large = pygame.font.SysFont("Arial", 54)   
-        font_small = pygame.font.SysFont("Arial", 26)   
-        font_menu = pygame.font.SysFont("Arial", 18)   
+    except Exception:
+        font_large = pygame.font.SysFont("Arial", 54)
+        font_small = pygame.font.SysFont("Arial", 26)
+        font_menu = pygame.font.SysFont("Arial", 18)
 
-    beep = generate_beep_sound(frequency=1000, sample_rate=44100)
+    beep = generate_beep_sound()
+    is_pressing, press_start_time, release_start_time = False, 0, time.time()
+    current_code, decoded_text, current_wpm = "", "", INITIAL_WPM
+    is_muted, crt_on, is_fullscreen = False, True, False
 
-    is_pressing = False
-    press_start_time = 0
-    release_start_time = time.time()
+    # UI 交互热区
+    mute_rect = pygame.Rect(VIRTUAL_WIDTH - 60, 15, 40, 40)
+    crt_rect = pygame.Rect(VIRTUAL_WIDTH - 110, 15, 40, 40)
+    fullscreen_rect = pygame.Rect(VIRTUAL_WIDTH - 160, 15, 40, 40)
 
-    current_code = ""
-    decoded_text = ""
-    current_wpm = INITIAL_WPM
-
-    is_muted = False
-    mute_rect = pygame.Rect(WIDTH - 60, 15, 40, 40) 
-    
-    crt_on = True 
-    crt_rect = pygame.Rect(WIDTH - 110, 15, 40, 40) 
-
-    is_started = False  
-    has_broken_char = True
-    has_broken_word = True
-    scroll_speed = 3  
-
+    is_started, has_broken_char, has_broken_word, scroll_speed = False, True, True, 3
     dot_duration_history = [INITIAL_DOT_DURATION] * WINDOW_SIZE
-
-    LOW_LEVEL = 390   
-    HIGH_LEVEL = 290  
-    wave_history = [LOW_LEVEL] * WIDTH
-
+    wave_history = [390.0] * VIRTUAL_WIDTH  # 变更为浮点数以支持平滑的时间步进
     clock = pygame.time.Clock()
     start_time_stamp = time.time()
-    running = True
 
-    while running:
+    # 累积的时间余量，用于解决亚像素级别的方波步进
+    accumulated_time = 0.0
+
+    # 5.4 内部辅助逻辑
+    def toggle_screen_mode():
+        if sys.platform == "win32":
+            pt = POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            pygame.display.toggle_fullscreen()
+            ctypes.windll.user32.SetCursorPos(pt.x, pt.y)
+        else:
+            pygame.display.toggle_fullscreen()
+        disable_ime()
+
+    def sync_audio_state():
+        if is_pressing:
+            beep.stop() if is_muted else beep.play(-1)
+
+    # 5.5 主循环开始
+    while True:
+        # 获取两帧之间的时间差（秒数），用于独立于帧率的平滑渲染
+        # 如果你想限制在 120 帧，将 tick() 参数改为 120
+        # 如果想完全不限制帧率（不锁帧），将 tick() 参数改为 0
+        dt = clock.tick(0) / 1000.0
         current_time = time.time()
-        FPS = 60
+        avg_dot_duration = sum(dot_duration_history) / WINDOW_SIZE
 
-        avg_dot_duration = sum(dot_duration_history) / len(dot_duration_history)
+        # 判定阈值计算
         dash_threshold = avg_dot_duration * 2.0
         char_timeout = avg_dot_duration * 3.0
         word_timeout = avg_dot_duration * 7.0
 
+        # --- 事件处理阶段 ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                running = False
+                pygame.quit()
+                sys.exit()
 
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
-                    if mute_rect.collidepoint(event.pos):
-                        is_muted = not is_muted
-                        if is_muted and is_pressing: beep.stop()
-                        elif not is_muted and is_pressing: beep.play(-1)
-                    elif crt_rect.collidepoint(event.pos):
-                        crt_on = not crt_on
+            elif event.type == pygame.VIDEORESIZE:
+                current_window_w, current_window_h = event.w, event.h
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                # 鼠标坐标还原成虚拟画布像素点
+                vp_x, vp_y, vp_w, vp_h = calculate_viewport(current_window_w, current_window_h)
+                v_mx = int((event.pos[0] - vp_x) * (VIRTUAL_WIDTH / vp_w))
+                v_my = int((event.pos[1] - vp_y) * (VIRTUAL_HEIGHT / vp_h))
+
+                if mute_rect.collidepoint((v_mx, v_my)):
+                    is_muted = not is_muted
+                    sync_audio_state()
+                elif crt_rect.collidepoint((v_mx, v_my)):
+                    crt_on = not crt_on
+                elif fullscreen_rect.collidepoint((v_mx, v_my)):
+                    is_fullscreen = not is_fullscreen
+                    toggle_screen_mode()
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE and not is_pressing:
-                    is_pressing = True
-                    is_started = True  
-                    press_start_time = current_time
-                    if not is_muted: beep.play(-1)
-                elif event.key == pygame.K_UP:
+                    is_pressing, is_started, press_start_time = True, True, current_time
+                    if not is_muted:
+                        beep.play(-1)
+                elif event.key == pygame.K_RIGHT:
                     scroll_speed = min(15, scroll_speed + 1)
-                elif event.key == pygame.K_DOWN:
+                elif event.key == pygame.K_LEFT:
                     scroll_speed = max(1, scroll_speed - 1)
                 elif event.key == pygame.K_m:
                     is_muted = not is_muted
-                    if is_muted and is_pressing: beep.stop()
-                    elif not is_muted and is_pressing: beep.play(-1)
-                elif event.key == pygame.K_c:  
+                    sync_audio_state()
+                elif event.key == pygame.K_c:
                     crt_on = not crt_on
+                elif event.key in (pygame.K_F11, pygame.K_f):
+                    is_fullscreen = not is_fullscreen
+                    toggle_screen_mode()
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    sys.exit()
 
-            elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
-                if is_pressing:
-                    is_pressing = False
-                    beep.stop()
-                    release_start_time = current_time
-                    has_broken_char = False
-                    has_broken_word = False
-                    duration = current_time - press_start_time
+            elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and is_pressing:
+                is_pressing = False
+                beep.stop()
+                release_start_time = current_time
+                has_broken_char = has_broken_word = False
 
-                    if duration < dash_threshold:
-                        current_code += "."
-                    else:
-                        current_code += "-"
+                # 记录录入信号并调整自动识别速度 (WPM 动态学习)
+                duration = current_time - press_start_time
+                current_code += "-" if duration >= dash_threshold else "."
 
-                    measured_dot = duration if duration < dash_threshold else duration / 3.0
-                    measured_dot = max(1.2 / 60, min(1.2 / 5, measured_dot))
-                    dot_duration_history.pop(0)
-                    dot_duration_history.append(measured_dot)
+                measured_dot = max(1.2 / 60, min(1.2 / 5, duration if duration < dash_threshold else duration / 3.0))
+                dot_duration_history.pop(0)
+                dot_duration_history.append(measured_dot)
+                current_wpm = 1.2 / (sum(dot_duration_history) / WINDOW_SIZE)
 
-                    new_avg = sum(dot_duration_history) / len(dot_duration_history)
-                    current_wpm = 1.2 / new_avg
+                # 六点清屏判定
+                if current_code == "......":
+                    current_code = decoded_text = ""
+                    has_broken_char = has_broken_word = True
 
-                    if current_code == "......":
-                        current_code = ""
-                        decoded_text = ""
-                        has_broken_char = True
-                        has_broken_word = True
-
+        # --- 自动断字/断词判定时间线 ---
         if not is_pressing:
-            silence_duration = current_time - release_start_time
-            if not has_broken_char and silence_duration >= char_timeout:
+            silence = current_time - release_start_time
+            if not has_broken_char and silence >= char_timeout:
                 if current_code:
-                    if current_code in MORSE_DICT:
-                        decoded_text += MORSE_DICT[current_code]
-                    else:
-                        decoded_text += "?"
+                    decoded_text += MORSE_DICT.get(current_code, "?")
                     current_code = ""
                 has_broken_char = True
 
-            if not has_broken_word and silence_duration >= word_timeout:
+            if not has_broken_word and silence >= word_timeout:
                 if decoded_text and not decoded_text.endswith(" "):
                     decoded_text += " "
                 has_broken_word = True
 
-        for _ in range(scroll_speed):
-            wave_history.pop(0)
-            wave_history.append(HIGH_LEVEL if is_pressing else LOW_LEVEL)
+        # --- 独立于帧率的方波历史位移计算 ---
+        # 60fps基准下每秒移动 60 * scroll_speed 个像素。
+        # 这里通过 dt 计算出当前帧应该移动的精确像素点数，防止高 FPS 下波形跑得太快。
+        accumulated_time += dt
+        pixels_to_move = int(accumulated_time * 60.0 * scroll_speed)
+        if pixels_to_move > 0:
+            accumulated_time -= pixels_to_move / (60.0 * scroll_speed)
+            # 限制单帧最大位移，防止极端掉帧引起的波形瞬移
+            pixels_to_move = min(pixels_to_move, VIRTUAL_WIDTH)
 
-        # =====================================================================
-        # 画面绘制逻辑面
-        # =====================================================================
+            wave_history = wave_history[pixels_to_move:] + [290.0 if is_pressing else 390.0] * pixels_to_move
+
+        # --- 2D 画布渲染阶段 ---
         pg_surface.fill((8, 14, 10))
-        
-        if decoded_text:
-            display_text = decoded_text[-26:]  
-        elif not is_started:
-            display_text = "Press Space to Start"
-        else:
-            display_text = ""  
-            
-        text_surface = font_large.render(display_text, True, (0, 245, 180)) 
-        text_rect = text_surface.get_rect(center=(WIDTH // 2, 145))
-        pg_surface.blit(text_surface, text_rect)
 
+        # 绘制主解码文本
+        display_text = decoded_text[-26:] if decoded_text else ("Press Space to Start" if not is_started else "")
+        text_surface = font_large.render(display_text, True, (0, 245, 180))
+        pg_surface.blit(text_surface, text_surface.get_rect(center=(VIRTUAL_WIDTH // 2, 145)))
+
+        # 绘制当前正在录入的代码 (. / -)
         code_surface = font_small.render(current_code, True, (0, 255, 200))
-        code_rect = code_surface.get_rect(center=(WIDTH // 2, 210))
-        pg_surface.blit(code_surface, code_rect)
+        pg_surface.blit(code_surface, code_surface.get_rect(center=(VIRTUAL_WIDTH // 2, 210)))
 
+        # 生成方波线段点阵
         square_wave_points = []
-        for x in range(WIDTH):
-            y = wave_history[x]
+        for x in range(VIRTUAL_WIDTH):
             if x > 0 and wave_history[x] != wave_history[x - 1]:
-                square_wave_points.append((x, wave_history[x - 1]))
-            square_wave_points.append((x, y))
-
+                square_wave_points.append((x, int(wave_history[x - 1])))
+            square_wave_points.append((x, int(wave_history[x])))
         if len(square_wave_points) > 1:
             pygame.draw.lines(pg_surface, (0, 230, 140), False, square_wave_points, 3)
 
-        wpm_surface = font_small.render(f"WPM: {current_wpm:.1f}", True, (230, 170, 40))
-        wpm_rect = wpm_surface.get_rect(bottomright=(WIDTH - 25, HEIGHT - 20))
-        pg_surface.blit(wpm_surface, wpm_rect)
+        # 渲染底部状态和菜单
+        pg_surface.blit(font_small.render(f"WPM: {current_wpm:.1f}", True, (230, 170, 40)),
+                        (VIRTUAL_WIDTH - 165, VIRTUAL_HEIGHT - 45))
 
-        speed_surface = font_small.render(f"Speed: {scroll_speed}", True, (100, 110, 105))
-        speed_rect = speed_surface.get_rect(bottomleft=(25, HEIGHT - 20))
-        pg_surface.blit(speed_surface, speed_rect)
+        # # 实时显示 FPS，方便你观察不锁帧时的性能
+        # fps_text = f"FPS: {clock.get_fps():.0f}"
+        # pg_surface.blit(font_small.render(fps_text, True, (100, 110, 105)), (VIRTUAL_WIDTH - 300, VIRTUAL_HEIGHT - 45))
 
-        menu_items = [
-            "[Up/ Down] : Adjust Wave Speed",
-            "[M] / Icon : Toggle Mute",
-            "[C] / Icon : Toggle CRT Effect",  
-            "6 Dots [......] : Clear All"
-        ]
+        # 构造进度条
+        max_ticks = 15
+        bar_filled = "■" * scroll_speed
+        bar_empty = "□" * (max_ticks - scroll_speed)
+        speed_bar_text = f"WAVE SPEED  [{bar_filled}{bar_empty}]"
+
+        speed_surf = font_small.render(speed_bar_text, True, (0, 255, 200))
+        pg_surface.blit(speed_surf, (25, VIRTUAL_HEIGHT - 45))
+
+        menu_items = ["[Left / Right] : Adjust Speed",
+                      "[......] (6 dots) : Clear All",
+                      "[Esc] : Quit",]
         for index, text in enumerate(menu_items):
-            item_surface = font_menu.render(text, True, (55, 95, 85))
-            pg_surface.blit(item_surface, (20, 18 + index * 24))
+            pg_surface.blit(font_menu.render(text, True, (55, 95, 85)), (20, 18 + index * 24))
 
+        # 绘制交互图标
         draw_mute_icon(pg_surface, mute_rect, is_muted)
-        draw_crt_icon(pg_surface, crt_rect, crt_on)  
+        draw_crt_icon(pg_surface, crt_rect, crt_on)
+        draw_fullscreen_icon(pg_surface, fullscreen_rect, is_fullscreen)
 
-        # =====================================================================
-        # 【GPU 多级渲染核心：流光暂留处理 + CRT 滤镜】
-        # =====================================================================
-        # 1. 抓取当前帧原始图像并写入输入纹理
-        texture_data = pygame.image.tostring(pg_surface, 'RGBA', True)
-        texture_input.write(texture_data)
-        
-        # 2. 根据状态决定是否通过 Ping-Pong FBO 计算残影
+        # 绘制图标下的单键快捷键文本指示
+        f_color = (0, 255, 200) if is_fullscreen else (65, 85, 90)
+        c_color = (0, 255, 200) if crt_on else (65, 85, 90)
+        m_color = (65, 85, 90) if is_muted else (0, 255, 200)
+
+        f_surf = font_menu.render("F", True, f_color)
+        c_surf = font_menu.render("C", True, c_color)
+        m_surf = font_menu.render("M", True, m_color)
+
+        pg_surface.blit(f_surf, f_surf.get_rect(center=(fullscreen_rect.centerx, fullscreen_rect.bottom + 12)))
+        pg_surface.blit(c_surf, c_surf.get_rect(center=(crt_rect.centerx, crt_rect.bottom + 12)))
+        pg_surface.blit(m_surf, m_surf.get_rect(center=(mute_rect.centerx, mute_rect.bottom + 12)))
+
+        # --- GPU着色器混合与后期处理阶段 ---
+        texture_input.write(pygame.image.tostring(pg_surface, 'RGBA', True))
+        vp_x, vp_y, vp_w, vp_h = calculate_viewport(current_window_w, current_window_h)
+
+        # 切换前后帧缓冲区（残影计算）
+        active_fbo = fbo_A if flip_flop else fbo_B
+        prev_tex = persist_tex_B if flip_flop else persist_tex_A
+        out_tex = persist_tex_A if flip_flop else persist_tex_B
+
+        # 动态计算余晖衰减：根据当前的 dt 来调整每次混合时的衰减度
+        # 原本 60 帧（0.0166秒）下是 0.68，那么在高帧率或更低帧率下自动进行指数映射
         if crt_on:
-            # 荧光暂留衰减率：0.88-0.94之间，值越大，流光尾迹保留越长
-            decay_rate = 0.68 
-            
-            if flip_flop:
-                # 绑定 FBO_A 作为输出，读取上一帧的成品 FBO_B 和当前帧输入
-                fbo_A.use()
-                texture_input.use(0)
-                persist_tex_B.use(1)
-                prog_persist['u_current_frame'].value = 0
-                prog_persist['u_prev_frame'].value = 1
-                prog_persist['u_decay'].value = decay_rate
-                vao_persist.render()
-                
-                # 最终显示：把带有流光计算完毕的 FBO_A 送入 CRT 主着色器上屏
-                ctx.screen.use()
-                persist_tex_A.use(0)
-            else:
-                # 倒转方向写回 FBO_B
-                fbo_B.use()
-                texture_input.use(0)
-                persist_tex_A.use(1)
-                prog_persist['u_current_frame'].value = 0
-                prog_persist['u_prev_frame'].value = 1
-                prog_persist['u_decay'].value = decay_rate
-                vao_persist.render()
-                
-                ctx.screen.use()
-                persist_tex_B.use(0)
-                
-            flip_flop = not flip_flop # 换向
+            current_decay = math.pow(0.60, dt / (1.0 / 60.0))
         else:
-            # =====================================================================
-            # 【核心修复部分】当 CRT 关闭时，强制让历史缓冲区同步当前干净帧。
-            # 将衰减系数 (u_decay) 设为 0.0，使历史遗留瞬间清零，但不停止缓冲区的运转。
-            # =====================================================================
-            if flip_flop:
-                fbo_A.use()
-                texture_input.use(0)
-                persist_tex_B.use(1)
-                prog_persist['u_current_frame'].value = 0
-                prog_persist['u_prev_frame'].value = 1
-                prog_persist['u_decay'].value = 0.0  # 衰减设为 0，擦除过去的所有强光残留
-                vao_persist.render()
-                
-                ctx.screen.use()
-                texture_input.use(0)
-            else:
-                fbo_B.use()
-                texture_input.use(0)
-                persist_tex_A.use(1)
-                prog_persist['u_current_frame'].value = 0
-                prog_persist['u_prev_frame'].value = 1
-                prog_persist['u_decay'].value = 0.0  # 同步清空
-                vao_persist.render()
-                
-                ctx.screen.use()
-                texture_input.use(0)
-                
-            flip_flop = not flip_flop
+            current_decay = 0.0
 
-        # 3. 运行主 CRT 显示管模拟
+        # 渲染余晖残影着色器
+        active_fbo.use()
+        ctx.viewport = (0, 0, VIRTUAL_WIDTH, VIRTUAL_HEIGHT)
+        texture_input.use(0)
+        prev_tex.use(1)
+        prog_persist['u_current_frame'].value = 0
+        prog_persist['u_prev_frame'].value = 1
+        prog_persist['u_decay'].value = current_decay
+        vao_persist.render()
+
+        # 渲染最终的 CRT 模拟着色器到屏幕
+        ctx.screen.use()
         ctx.clear(0.0, 0.0, 0.0, 1.0)
+        ctx.viewport = (vp_x, vp_y, vp_w, vp_h)
+        (out_tex if crt_on else texture_input).use(0)
+
+        flip_flop = not flip_flop
+
         if 'u_time' in prog_crt:
             prog_crt['u_time'].value = time.time() - start_time_stamp
         if 'u_crt_on' in prog_crt:
             prog_crt['u_crt_on'].value = crt_on
-            
         vao_crt.render()
 
         pygame.display.flip()
-        clock.tick(FPS)
 
-    pygame.quit()
-    sys.exit()
 
 if __name__ == "__main__":
     main()
